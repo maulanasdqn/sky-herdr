@@ -1138,6 +1138,13 @@ impl App {
                     "agent.wait is handled by the api server",
                 );
             }
+            Method::AgentWaitMany(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "agent.wait_many is handled by the api server",
+                );
+            }
             Method::AgentRead(params) => return self.handle_agent_read(request.id, params),
             Method::AgentExplain(target) => return self.handle_agent_explain(request.id, target),
             Method::AgentSendKeys(params) => {

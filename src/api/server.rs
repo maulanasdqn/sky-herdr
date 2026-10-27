@@ -14,7 +14,9 @@ use crate::api::schema::{
     ErrorBody, ErrorResponse, Method, Request, ResponseResult, ServerCapabilities, SuccessResponse,
 };
 use crate::api::subscriptions::ActiveSubscription;
-use crate::api::wait::{prompt_agent, wait_for_agent, wait_for_event, wait_for_output};
+use crate::api::wait::{
+    prompt_agent, wait_for_agent, wait_for_agents, wait_for_event, wait_for_output,
+};
 use crate::api::{request_changes_ui, socket_path, ApiRequestMessage, ApiRequestSender, EventHub};
 use crate::ipc::{
     bind_local_listener, is_connection_closed_error, local_stream_peer_closed,
@@ -471,6 +473,17 @@ fn handle_connection_with_stop(
         }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                event_hub,
+                running,
+            )?;
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
+        Method::AgentWaitMany(params) => {
+            let response = wait_for_agents(
                 request_id.clone(),
                 params,
                 &mut stream,
@@ -1630,6 +1643,161 @@ mod tests {
         assert_eq!(response["error"]["message"], "pane pane_1 not found");
         drop(api_tx);
         responder.join().unwrap();
+    }
+
+    fn wait_many_agent(
+        name: &str,
+        agent_status: crate::api::schema::AgentStatus,
+        state_change_seq: u64,
+    ) -> crate::api::schema::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": format!("term_{name}"),
+            "name": name,
+            "agent": "pi",
+            "agent_status": agent_status,
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": format!("w1:{name}"),
+            "focused": false,
+            "state_change_seq": state_change_seq,
+            "revision": 0,
+        }))
+        .unwrap()
+    }
+
+    /// Serves `old` idle since seq 3 and `fresh`, which settles on the second list.
+    fn spawn_wait_many_responder(
+        event_hub: EventHub,
+    ) -> (ApiRequestSender, std::thread::JoinHandle<()>) {
+        use crate::api::schema::AgentStatus;
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let responder = std::thread::spawn(move || {
+            let mut lists = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                let result = match msg.request.method {
+                    Method::AgentGet(target) => match target.target.as_str() {
+                        "old" => ResponseResult::AgentInfo {
+                            agent: wait_many_agent("old", AgentStatus::Idle, 3),
+                        },
+                        "fresh" => ResponseResult::AgentInfo {
+                            agent: wait_many_agent("fresh", AgentStatus::Working, 4),
+                        },
+                        other => {
+                            let error = error_response_json(
+                                msg.request.id,
+                                "agent_not_found",
+                                format!("agent target {other} not found"),
+                            );
+                            msg.respond_to.send(error).unwrap();
+                            continue;
+                        }
+                    },
+                    Method::AgentList(_) => {
+                        lists += 1;
+                        let fresh = if lists == 1 {
+                            event_hub.push(crate::api::schema::EventEnvelope {
+                                event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+                                data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                                    pane_id: "w1:fresh".into(),
+                                    workspace_id: "w1".into(),
+                                    agent_status: AgentStatus::Idle,
+                                    agent: Some("pi".into()),
+                                    title: None,
+                                    display_agent: None,
+                                    state_labels: HashMap::new(),
+                                },
+                            });
+                            wait_many_agent("fresh", AgentStatus::Working, 4)
+                        } else {
+                            wait_many_agent("fresh", AgentStatus::Idle, 9)
+                        };
+                        ResponseResult::AgentList {
+                            agents: vec![wait_many_agent("old", AgentStatus::Idle, 3), fresh],
+                            state_cursor: Some(format!("e.{}", if lists == 1 { 5 } else { 9 })),
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                msg.respond_to
+                    .send(
+                        serde_json::to_string(&SuccessResponse {
+                            id: msg.request.id,
+                            result,
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+        });
+        (api_tx, responder)
+    }
+
+    fn run_wait_many(name: &str, request: &str) -> serde_json::Value {
+        let event_hub = EventHub::default();
+        let (api_tx, responder) = spawn_wait_many_responder(event_hub.clone());
+        let (mut client, server, _path) = local_stream_pair(name);
+        client.write_all(request.as_bytes()).unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+        serde_json::from_str(&read_line(&mut client)).unwrap()
+    }
+
+    fn wait_many_names(response: &serde_json::Value, list: &str) -> Vec<String> {
+        response["result"][list]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["name"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn agent_wait_many_wakes_on_a_state_reached_after_the_cursor() {
+        let response = run_wait_many(
+            "api-wait-many-since",
+            r#"{"id":"many","method":"agent.wait_many","params":{"targets":["old","fresh","old"],"since":"e.5","timeout_ms":5000}}"#,
+        );
+
+        assert_eq!(response["id"], "many");
+        assert_eq!(response["result"]["type"], "agent_wait_many");
+        assert_eq!(wait_many_names(&response, "settled"), ["fresh"]);
+        assert_eq!(wait_many_names(&response, "pending"), ["old"]);
+        assert_eq!(response["result"]["exited"], serde_json::json!([]));
+        assert_eq!(response["result"]["missing"], serde_json::json!([]));
+        assert_eq!(response["result"]["state_cursor"], "e.9");
+    }
+
+    #[test]
+    fn agent_wait_many_ignores_a_cursor_from_another_server() {
+        let response = run_wait_many(
+            "api-wait-many-stale",
+            r#"{"id":"stale","method":"agent.wait_many","params":{"targets":["old","fresh","ghost"],"since":"1.500","timeout_ms":5000}}"#,
+        );
+
+        assert_eq!(wait_many_names(&response, "settled"), ["old"]);
+        assert_eq!(wait_many_names(&response, "pending"), ["fresh"]);
+        assert_eq!(response["result"]["missing"], serde_json::json!(["ghost"]));
+        assert_eq!(response["result"]["state_cursor"], "e.5");
+    }
+
+    #[test]
+    fn agent_wait_many_rejects_empty_targets_and_malformed_cursors() {
+        let empty = run_wait_many(
+            "api-wait-many-empty",
+            r#"{"id":"empty","method":"agent.wait_many","params":{"targets":[]}}"#,
+        );
+        assert_eq!(empty["error"]["code"], "invalid_agent_targets");
+
+        let malformed = run_wait_many(
+            "api-wait-many-cursor",
+            r#"{"id":"cursor","method":"agent.wait_many","params":{"targets":["old"],"since":"later"}}"#,
+        );
+        assert_eq!(malformed["error"]["code"], "invalid_agent_state_cursor");
     }
 
     #[test]

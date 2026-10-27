@@ -49,6 +49,8 @@ Successful `agent start` returns only after Herdr detects the expected agent in 
 herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 ```
 
+`agent start` records the calling pane as the agent's spawner. `agent start`, `agent get`, and `agent list` then report `spawned_by` with the spawning terminal's `terminal_id`, its current `pane_id` while that pane is open, and the `name` of the agent it currently hosts, if any. Lineage belongs to the agent name: renames, pane moves, server restarts, and live handoff keep it whenever they keep the name, and clearing or losing the name clears it. List the agents you started with `herdr agent list --children`, or another pane's with `--spawned-by <pane-or-agent>`. `--children` needs the calling pane, so with `--machine` use `--spawned-by` and a remote pane ID or agent name.
+
 Agents launched manually are detected automatically and can be addressed by pane ID. Give one a name when a stable human-readable target is useful:
 
 ```bash
@@ -68,12 +70,15 @@ herdr agent rename w1:p2 reviewer
 | Submit a prompt, optionally waiting for it | `agent prompt` |
 | Send keys to an agent's interactive UI | `agent send-keys` |
 | Wait for agent lifecycle state | `agent wait` |
+| Wait for the first, or every one, of several agents | `agent wait-many` |
 
 `agent prompt` submits text plus encoded Enter and honors the terminal's live bracketed-paste mode. It can prompt an agent that is already working. If the agent is already `blocked`, it returns `agent_blocked` without sending terminal input; inspect the dialog and use `agent send-keys` for a deliberate response. Use `agent send-keys` for interactions such as `esc`, `up`, `enter`, or `ctrl+c`; `escape` is accepted as an alias for `esc`. Use the pane input commands when you deliberately want raw terminal control.
 
 Pane input addresses the terminal regardless of its current occupant. Agent input resolves the live agent and rejects the operation if that agent no longer controls the pane.
 
 `agent prompt --wait` rejects an agent already `blocked` with `agent_blocked`, without sending input or starting a wait. Otherwise, it writes the prompt and delayed Enter as one ordered submission before waiting. On Windows, Codex receives a paste boundary before Enter so submission does not depend on prompt size. The caller timeout includes submission time. If the prompt started from another non-working state, Herdr waits up to five seconds after submission to observe `working` or `blocked`. Otherwise, it returns `agent_prompt_stalled`; if the caller timeout expires first, it returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After Herdr observes activity, it waits for the requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. Standalone `agent wait` observes the current agent and returns immediately if its status already matches. Both commands default to `idle`, `done`, or `blocked`. Repeat `--until` to accept several exact states, for example `--until idle --until done`; use `--until unknown` explicitly when needed. On `agent prompt`, `--until` requires `--wait`.
+
+`agent wait-many` waits on several agents in one request. Pass targets, `--children` for the live agents started from the calling pane, or `--spawned-by`. It returns as soon as any target settles; with `--all` it waits until every target has settled or exited. The result lists `settled`, `pending`, and `exited` agents, the `missing` targets that did not resolve to a live agent, and a `state_cursor`. Without `--since`, a target already in a requested state settles immediately, as with `agent wait`. With `--since`, only states reached after that cursor count: take the cursor from `agent list` before you prompt, so a worker that is still idle from before the prompt does not settle, then pass each response's cursor to the next `wait-many`, so each state change is reported once. A target that stays in a reported state, such as a worker left `blocked`, settles again only after it changes and meanwhile appears in `pending`. Each target is pinned to the agent that occupied it when the wait started; if that agent exits or is replaced, the target is reported in `exited`. A cursor issued by another server process, for example before a restart, is ignored, so a state can be reported twice but is not missed. `wait-many` uses the same default states as `agent wait`, and `--timeout` returns the normal `timeout` error.
 
 `idle` and `done` both mean the agent is ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so a client's Done badge can differ from the CLI or another client's badge. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify its lifecycle confidently; it does not prove successful completion. Use exact `--until` states when that distinction matters.
 
@@ -107,6 +112,21 @@ review_pane=$(printf '%s\n' "$split" | jq -r '.result.pane.pane_id')
 herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 herdr agent prompt reviewer "Review the current diff" --wait --timeout 120000
 herdr agent read reviewer --source recent-unwrapped --lines 120
+```
+
+Fan work out to several helpers started as above, and handle each one as it settles:
+
+```bash
+cursor=$(herdr agent list | jq -r '.result.state_cursor')
+herdr agent prompt api-worker "Implement the API change"
+herdr agent prompt ui-worker "Implement the UI change"
+
+while result=$(herdr agent wait-many --children --since "$cursor" --timeout 600000); do
+  cursor=$(printf '%s\n' "$result" | jq -r '.result.state_cursor')
+  printf '%s\n' "$result" | jq -r '.result.settled[] | "\(.name) \(.agent_status)"'
+  # Read finished workers, answer blocked ones, or prompt follow-up work here.
+  [ "$(printf '%s\n' "$result" | jq '.result.pending | length')" -gt 0 ] || break
+done
 ```
 
 Wait for an agent to ask for input, inspect it, and interact with its UI:

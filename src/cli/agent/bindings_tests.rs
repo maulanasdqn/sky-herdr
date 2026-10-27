@@ -20,6 +20,7 @@ fn params(args: &[&str]) -> serde_json::Value {
         Operation::Wait(params) => Method::AgentWait(params),
         Operation::Prompt(params) => Method::AgentPrompt(params),
         Operation::Start(params) => Method::AgentStart(params),
+        Operation::WaitMany(wait) => Method::AgentWaitMany(wait.params),
         _ => panic!("expected API params"),
     };
     serde_json::to_value(Request {
@@ -185,6 +186,55 @@ fn agent_projection_rename_and_local_adapters() {
 }
 
 #[test]
+fn agent_projection_wait_many_and_spawner_filters() {
+    assert_eq!(
+        params(&[
+            "wait-many",
+            "a",
+            "b",
+            "--all",
+            "--until=idle",
+            "--until",
+            "blocked",
+            "--since=7.40",
+            "--timeout=10"
+        ]),
+        serde_json::json!({"targets":["a", "b"], "all":true, "until":["idle", "blocked"], "since":"7.40", "timeout_ms":10})
+    );
+    assert_eq!(
+        params(&["wait-many", "a"]),
+        serde_json::json!({"targets":["a"]})
+    );
+    let Operation::WaitMany(wait) = parse(&["wait-many", "--children"]).unwrap() else {
+        panic!("wait-many")
+    };
+    assert!(wait.params.targets.is_empty());
+    assert!(wait.spawned_by.children);
+    let Operation::WaitMany(wait) = parse(&["wait-many", "--spawned-by", "lead"]).unwrap() else {
+        panic!("wait-many")
+    };
+    assert_eq!(wait.spawned_by.spawned_by.as_deref(), Some("lead"));
+
+    let Operation::List(filter) = parse(&["list"]).unwrap() else {
+        panic!("list")
+    };
+    assert!(!filter.is_set());
+    let Operation::List(filter) = parse(&["list", "--children"]).unwrap() else {
+        panic!("list")
+    };
+    assert!(filter.children && filter.is_set());
+    let Operation::Start(params) =
+        parse(&["start", "worker", "--kind=pi", "--pane=w1:p2"]).unwrap()
+    else {
+        panic!("start")
+    };
+    assert_eq!(
+        params.caller_pane_id, None,
+        "the command adds caller context, not the parser"
+    );
+}
+
+#[test]
 fn agent_projection_clap_relations_and_help_before_transport() {
     super::command().debug_assert();
     for args in [
@@ -198,6 +248,10 @@ fn agent_projection_clap_relations_and_help_before_transport() {
         vec!["start", "name", "--kind=codex"],
         vec!["explain", "--file=file"],
         vec!["explain", "opaque", "--agent=codex"],
+        vec!["wait-many"],
+        vec!["wait-many", "a", "--children"],
+        vec!["wait-many", "--children", "--spawned-by=lead"],
+        vec!["list", "--children", "--spawned-by=lead"],
     ] {
         assert!(
             matches!(parse(&args), Err(ParseError::Clap(error)) if error.exit_code() == 2),

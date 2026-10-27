@@ -4,9 +4,9 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, EventData, EventEnvelope, EventKind, EventMatch, EventsWaitParams,
-    Method, Request, ResponseResult, Subscription, SubscriptionEventData,
-    SubscriptionEventEnvelope, SuccessResponse,
+    AgentInfo, AgentStateCursor, AgentStatus, EmptyParams, ErrorBody, ErrorResponse, EventData,
+    EventEnvelope, EventKind, EventMatch, EventsWaitParams, Method, Request, ResponseResult,
+    Subscription, SubscriptionEventData, SubscriptionEventEnvelope, SuccessResponse,
 };
 use crate::api::server::{
     dispatch_to_app_with_caller_timeout, dispatch_to_app_with_timeout, should_stop_connection,
@@ -694,6 +694,326 @@ fn agent_wait_probe_error(response: ErrorResponse) -> std::io::Result<String> {
     serde_json::to_string(&response).map_err(std::io::Error::other)
 }
 
+pub(super) fn wait_for_agents(
+    request_id: String,
+    params: crate::api::schema::AgentWaitManyParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    if params.targets.is_empty() {
+        return wait_error(
+            request_id,
+            "invalid_agent_targets",
+            "agent.wait_many requires at least one target".into(),
+        )
+        .map(Some);
+    }
+    let since = match params.since.as_deref() {
+        None => None,
+        Some(value) => match AgentStateCursor::parse(value) {
+            Some(cursor) => Some(cursor),
+            None => {
+                return wait_error(
+                    request_id,
+                    "invalid_agent_state_cursor",
+                    format!("invalid agent state cursor {value}"),
+                )
+                .map(Some);
+            }
+        },
+    };
+    let deadline = params
+        .timeout_ms
+        .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    let mut last_event_sequence = event_hub.current_sequence();
+    let mut group = AgentWaitGroup::new(agent_wait_statuses(params.until), params.all);
+    for target in params.targets {
+        match agent_get(&request_id, &target, api_tx) {
+            Ok(agent) => group.track(&target, agent),
+            Err(response) if response.error.code == "agent_not_found" => group.miss(target),
+            Err(response) => {
+                return serde_json::to_string(&response)
+                    .map(Some)
+                    .map_err(std::io::Error::other);
+            }
+        }
+    }
+
+    // The first probe also learns the server cursor that decides whether `since` applies.
+    let mut should_probe = true;
+    loop {
+        if should_stop_connection(stream, running)? {
+            return Ok(None);
+        }
+
+        match event_hub.events_after_checked(last_event_sequence) {
+            Ok(events) => {
+                for (sequence, event) in events {
+                    last_event_sequence = sequence;
+                    should_probe |= group.observe_event(&event.data);
+                }
+            }
+            // Evicted history may hide a change, so fall back to the authoritative list.
+            Err(_) => {
+                last_event_sequence = event_hub.current_sequence();
+                should_probe = true;
+            }
+        }
+
+        let timed_out = deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        if should_probe || timed_out {
+            should_probe = false;
+            let (agents, cursor) = match agent_list(&request_id, api_tx) {
+                Ok(listed) => listed,
+                Err(response) => {
+                    return serde_json::to_string(&response)
+                        .map(Some)
+                        .map_err(std::io::Error::other);
+                }
+            };
+            let since_seq = since
+                .filter(|since| since.epoch == cursor.epoch)
+                .map(|since| since.seq);
+            group.observe_agents(&agents, since_seq);
+            if group.is_finished() {
+                return serde_json::to_string(&SuccessResponse {
+                    id: request_id,
+                    result: group.into_result(cursor),
+                })
+                .map(Some)
+                .map_err(std::io::Error::other);
+            }
+        }
+        if timed_out {
+            return wait_error(
+                request_id,
+                "timeout",
+                "timed out waiting for agent status".into(),
+            )
+            .map(Some);
+        }
+        std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+/// Settle rules for one `agent.wait_many` request, kept free of I/O.
+///
+/// Members are pinned by terminal identity like `agent.wait`, so a replacement
+/// occupant or a pane move cannot satisfy the wait under a stale target.
+struct AgentWaitGroup {
+    until: Vec<AgentStatus>,
+    all: bool,
+    members: Vec<AgentWaitMember>,
+    missing: Vec<String>,
+}
+
+struct AgentWaitMember {
+    expected_name: Option<String>,
+    expected_agent: Option<String>,
+    agent: AgentInfo,
+    /// Requested state seen in an event, kept in case it passed before the next probe.
+    observed_status: Option<AgentStatus>,
+    outcome: Option<AgentWaitMemberOutcome>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentWaitMemberOutcome {
+    Settled,
+    Exited,
+}
+
+impl AgentWaitGroup {
+    fn new(until: Vec<AgentStatus>, all: bool) -> Self {
+        Self {
+            until,
+            all,
+            members: Vec::new(),
+            missing: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, target: &str, agent: AgentInfo) {
+        if self
+            .members
+            .iter()
+            .any(|member| member.agent.terminal_id == agent.terminal_id)
+        {
+            return;
+        }
+        self.members.push(AgentWaitMember {
+            expected_name: agent.name.clone().filter(|name| name == target),
+            expected_agent: agent.agent.clone(),
+            agent,
+            observed_status: None,
+            outcome: None,
+        });
+    }
+
+    fn miss(&mut self, target: String) {
+        if !self.missing.contains(&target) {
+            self.missing.push(target);
+        }
+    }
+
+    /// Records event evidence and reports whether a pending member may have changed.
+    fn observe_event(&mut self, event: &EventData) -> bool {
+        let (pane_id, observed_status, released) = match event {
+            EventData::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+                ..
+            } => (pane_id, Some(*agent_status), false),
+            EventData::PaneAgentDetected {
+                pane_id,
+                released,
+                final_status,
+                ..
+            } => (pane_id, *final_status, *released),
+            EventData::PaneUpdated { pane } => (&pane.pane_id, None, false),
+            EventData::PaneMoved {
+                previous_pane_id, ..
+            } => (previous_pane_id, None, false),
+            EventData::PaneClosed { pane_id, .. } | EventData::PaneExited { pane_id, .. } => {
+                (pane_id, None, false)
+            }
+            _ => return false,
+        };
+        let until = &self.until;
+        let mut affected = false;
+        for member in self
+            .members
+            .iter_mut()
+            .filter(|member| member.outcome.is_none() && member.agent.pane_id == *pane_id)
+        {
+            affected = true;
+            // A release is authoritative even while the pane briefly keeps the agent name.
+            if released {
+                if let Some(status) = observed_status {
+                    member.agent.agent_status = status;
+                }
+                member.outcome = Some(AgentWaitMemberOutcome::Exited);
+            } else if let Some(status) = observed_status.filter(|status| until.contains(status)) {
+                member.observed_status = Some(status);
+            }
+        }
+        affected
+    }
+
+    /// Classifies pending members against one `agent.list` snapshot. A member
+    /// settles when it is in a requested state reached after `since`, or when an
+    /// event showed it passing through one since the previous probe.
+    fn observe_agents(&mut self, agents: &[AgentInfo], since: Option<u64>) {
+        let until = &self.until;
+        for member in self
+            .members
+            .iter_mut()
+            .filter(|member| member.outcome.is_none())
+        {
+            let current = agents.iter().find(|agent| {
+                agent_wait_identity_matches(
+                    agent,
+                    &member.agent.terminal_id,
+                    member.expected_name.as_deref(),
+                    member.expected_agent.as_deref(),
+                )
+            });
+            let Some(current) = current else {
+                if let Some(status) = member.observed_status {
+                    member.agent.agent_status = status;
+                }
+                member.outcome = Some(AgentWaitMemberOutcome::Exited);
+                continue;
+            };
+            member.agent = current.clone();
+            if agent_wait_matches(current, until, since) {
+                member.outcome = Some(AgentWaitMemberOutcome::Settled);
+            } else if let Some(status) = member.observed_status {
+                member.agent.agent_status = status;
+                member.outcome = Some(AgentWaitMemberOutcome::Settled);
+            }
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        if self.all {
+            self.members.iter().all(|member| member.outcome.is_some())
+        } else {
+            !self.missing.is_empty() || self.members.iter().any(|member| member.outcome.is_some())
+        }
+    }
+
+    fn into_result(self, cursor: AgentStateCursor) -> ResponseResult {
+        let mut settled = Vec::new();
+        let mut pending = Vec::new();
+        let mut exited = Vec::new();
+        for member in self.members {
+            match member.outcome {
+                Some(AgentWaitMemberOutcome::Settled) => settled.push(member.agent),
+                Some(AgentWaitMemberOutcome::Exited) => exited.push(member.agent),
+                None => pending.push(member.agent),
+            }
+        }
+        ResponseResult::AgentWaitMany {
+            settled,
+            pending,
+            exited,
+            missing: self.missing,
+            state_cursor: cursor.encode(),
+        }
+    }
+}
+
+fn agent_list(
+    request_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<(Vec<AgentInfo>, AgentStateCursor), ErrorResponse> {
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:agents"),
+            method: Method::AgentList(EmptyParams::default()),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let internal_error = |message: &str| ErrorResponse {
+        id: request_id.into(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: message.into(),
+        },
+    };
+    let value: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|_| internal_error("failed to decode agent list response"))?;
+    if value.get("error").is_some() {
+        let error = serde_json::from_value(value["error"].clone())
+            .map_err(|_| internal_error("failed to decode agent list error"))?;
+        return Err(ErrorResponse {
+            id: request_id.into(),
+            error,
+        });
+    }
+    let agents = serde_json::from_value(value["result"]["agents"].clone())
+        .map_err(|_| internal_error("failed to decode agent list result"))?;
+    let cursor = value["result"]["state_cursor"]
+        .as_str()
+        .and_then(AgentStateCursor::parse)
+        .ok_or_else(|| internal_error("agent list result did not include a state cursor"))?;
+    Ok((agents, cursor))
+}
+
+fn wait_error(request_id: String, code: &str, message: String) -> std::io::Result<String> {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id,
+        error: ErrorBody {
+            code: code.into(),
+            message,
+        },
+    })
+    .map_err(std::io::Error::other)
+}
+
 pub(super) fn wait_for_event(
     request_id: String,
     params: EventsWaitParams,
@@ -824,6 +1144,228 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(terminal_id: &str, name: &str, status: AgentStatus, seq: u64) -> AgentInfo {
+        AgentInfo {
+            terminal_id: terminal_id.into(),
+            name: Some(name.into()),
+            agent: Some("pi".into()),
+            title: None,
+            terminal_title: None,
+            terminal_title_stripped: None,
+            display_agent: None,
+            agent_status: status,
+            screen_detection_skipped: false,
+            state_labels: Default::default(),
+            tokens: Default::default(),
+            agent_session: None,
+            spawned_by: None,
+            workspace_id: "w1".into(),
+            tab_id: "w1:t1".into(),
+            pane_id: format!("w1:{terminal_id}"),
+            focused: false,
+            launch_pending: false,
+            interactive_ready: true,
+            state_change_seq: seq,
+            completion_seq: None,
+            cwd: None,
+            foreground_cwd: None,
+            revision: 0,
+        }
+    }
+
+    fn status_event(pane_id: &str, agent_status: AgentStatus) -> EventData {
+        EventData::PaneAgentStatusChanged {
+            pane_id: pane_id.into(),
+            workspace_id: "w1".into(),
+            agent_status,
+            agent: Some("pi".into()),
+            title: None,
+            display_agent: None,
+            state_labels: Default::default(),
+        }
+    }
+
+    fn names(agents: &[AgentInfo]) -> Vec<&str> {
+        agents
+            .iter()
+            .map(|agent| agent.name.as_deref().unwrap_or_default())
+            .collect()
+    }
+
+    fn group(all: bool, members: &[AgentInfo]) -> AgentWaitGroup {
+        let mut group = AgentWaitGroup::new(agent_wait_statuses(Vec::new()), all);
+        for member in members {
+            group.track(member.name.as_deref().unwrap(), member.clone());
+        }
+        group
+    }
+
+    const CURSOR: AgentStateCursor = AgentStateCursor { epoch: 7, seq: 40 };
+
+    fn wait_many_result(
+        group: AgentWaitGroup,
+    ) -> (Vec<AgentInfo>, Vec<AgentInfo>, Vec<AgentInfo>, Vec<String>) {
+        let ResponseResult::AgentWaitMany {
+            settled,
+            pending,
+            exited,
+            missing,
+            state_cursor,
+        } = group.into_result(CURSOR)
+        else {
+            panic!("expected agent_wait_many result");
+        };
+        assert_eq!(state_cursor, CURSOR.encode());
+        (settled, pending, exited, missing)
+    }
+
+    #[test]
+    fn agent_state_cursors_round_trip_and_reject_malformed_values() {
+        assert_eq!(AgentStateCursor::parse(&CURSOR.encode()), Some(CURSOR));
+        for value in ["", "7", "7.", ".40", "zz.40", "7.-1", "7.40.1"] {
+            assert_eq!(AgentStateCursor::parse(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn wait_many_any_returns_every_member_settled_in_the_same_snapshot() {
+        let a = agent("a", "a", AgentStatus::Working, 1);
+        let b = agent("b", "b", AgentStatus::Working, 2);
+        let c = agent("c", "c", AgentStatus::Working, 3);
+        let mut group = group(false, &[a.clone(), b.clone(), c.clone()]);
+
+        group.observe_agents(&[a.clone(), b.clone(), c.clone()], None);
+        assert!(!group.is_finished());
+
+        let b_done = agent("b", "b", AgentStatus::Done, 8);
+        let c_blocked = agent("c", "c", AgentStatus::Blocked, 9);
+        group.observe_agents(&[a, b_done, c_blocked], None);
+        assert!(group.is_finished());
+        let (settled, pending, exited, missing) = wait_many_result(group);
+        assert_eq!(names(&settled), ["b", "c"]);
+        assert_eq!(names(&pending), ["a"]);
+        assert!(exited.is_empty() && missing.is_empty());
+    }
+
+    #[test]
+    fn wait_many_since_ignores_states_reached_before_the_cursor() {
+        let idle_before = agent("a", "a", AgentStatus::Idle, 5);
+        let mut group = group(false, std::slice::from_ref(&idle_before));
+
+        group.observe_agents(std::slice::from_ref(&idle_before), Some(5));
+        assert!(
+            !group.is_finished(),
+            "a state at the cursor already counted"
+        );
+
+        group.observe_agents(&[agent("a", "a", AgentStatus::Working, 6)], Some(5));
+        assert!(!group.is_finished());
+        group.observe_agents(&[agent("a", "a", AgentStatus::Idle, 7)], Some(5));
+        assert!(group.is_finished());
+    }
+
+    #[test]
+    fn wait_many_counts_a_requested_state_that_passed_between_probes() {
+        let working = agent("a", "a", AgentStatus::Working, 1);
+        let mut group = group(false, std::slice::from_ref(&working));
+        group.observe_agents(std::slice::from_ref(&working), None);
+
+        assert!(group.observe_event(&status_event("w1:a", AgentStatus::Blocked)));
+        group.observe_agents(&[agent("a", "a", AgentStatus::Working, 3)], None);
+
+        let (settled, ..) = wait_many_result(group);
+        assert_eq!(settled[0].agent_status, AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn wait_many_reports_a_replaced_or_vanished_member_as_exited() {
+        let a = agent("a", "a", AgentStatus::Working, 1);
+        let b = agent("b", "b", AgentStatus::Working, 2);
+        let mut group = group(true, &[a, b]);
+
+        let mut replaced = agent("a", "a", AgentStatus::Idle, 4);
+        replaced.agent = Some("codex".into());
+        group.observe_agents(&[replaced], None);
+
+        assert!(group.is_finished());
+        let (settled, pending, exited, _) = wait_many_result(group);
+        assert!(settled.is_empty() && pending.is_empty());
+        assert_eq!(names(&exited), ["a", "b"]);
+        assert_eq!(exited[0].agent.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn wait_many_reports_a_released_member_as_exited_while_its_name_lingers() {
+        let idle = agent("a", "a", AgentStatus::Idle, 5);
+        let mut group = group(false, std::slice::from_ref(&idle));
+        group.observe_agents(std::slice::from_ref(&idle), Some(5));
+
+        assert!(group.observe_event(&EventData::PaneAgentDetected {
+            pane_id: "w1:a".into(),
+            workspace_id: "w1".into(),
+            agent: None,
+            released: true,
+            final_status: Some(AgentStatus::Idle),
+        }));
+        let mut lingering = idle.clone();
+        lingering.agent = None;
+        group.observe_agents(&[lingering], Some(5));
+
+        let (settled, _, exited, _) = wait_many_result(group);
+        assert!(settled.is_empty());
+        assert_eq!(names(&exited), ["a"]);
+        assert_eq!(exited[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn wait_many_all_waits_for_every_member_and_keeps_the_settled_snapshot() {
+        let a = agent("a", "a", AgentStatus::Working, 1);
+        let b = agent("b", "b", AgentStatus::Working, 2);
+        let mut group = group(true, &[a, b.clone()]);
+
+        group.observe_agents(&[agent("a", "a", AgentStatus::Idle, 3), b.clone()], None);
+        assert!(!group.is_finished());
+
+        group.observe_agents(
+            &[
+                agent("a", "a", AgentStatus::Working, 4),
+                agent("b", "b", AgentStatus::Idle, 5),
+            ],
+            None,
+        );
+        assert!(group.is_finished());
+        let (settled, ..) = wait_many_result(group);
+        assert_eq!(names(&settled), ["a", "b"]);
+        assert_eq!(settled[0].agent_status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn wait_many_missing_targets_end_an_any_wait_but_not_an_all_wait() {
+        let working = agent("a", "a", AgentStatus::Working, 1);
+
+        let mut any = group(false, std::slice::from_ref(&working));
+        any.miss("ghost".into());
+        any.observe_agents(std::slice::from_ref(&working), None);
+        assert!(any.is_finished());
+
+        let mut all = group(true, std::slice::from_ref(&working));
+        all.miss("ghost".into());
+        all.observe_agents(std::slice::from_ref(&working), None);
+        assert!(!all.is_finished());
+    }
+
+    #[test]
+    fn wait_many_tracks_each_terminal_once_and_ignores_unrelated_events() {
+        let a = agent("a", "a", AgentStatus::Working, 1);
+        let mut group = AgentWaitGroup::new(agent_wait_statuses(Vec::new()), false);
+        group.track("a", a.clone());
+        group.track("w1:a", a);
+        assert_eq!(group.members.len(), 1);
+
+        assert!(!group.observe_event(&status_event("w1:other", AgentStatus::Idle)));
+        assert!(group.members[0].observed_status.is_none());
+    }
 
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {

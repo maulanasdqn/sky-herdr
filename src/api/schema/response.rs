@@ -106,6 +106,21 @@ pub enum ResponseResult {
     },
     AgentList {
         agents: Vec<AgentInfo>,
+        /// Current position in the agent state-change sequence, for `agent.wait_many` `since`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state_cursor: Option<String>,
+    },
+    AgentWaitMany {
+        /// Targets in a requested state after the cursor, as observed when they settled.
+        settled: Vec<AgentInfo>,
+        /// Targets that have not settled yet.
+        pending: Vec<AgentInfo>,
+        /// Targets that stopped hosting the waited agent, with their last observed state.
+        exited: Vec<AgentInfo>,
+        /// Requested targets that did not resolve to a live agent.
+        missing: Vec<String>,
+        /// Pass back as `since` so already reported state changes do not settle again.
+        state_cursor: String,
     },
     AgentView {
         active: bool,

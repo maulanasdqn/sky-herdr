@@ -193,6 +193,28 @@ cli_params! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout_ms: Option<u64> => Field::new(None).input(bindings::timeout()
             .help("Wait for interactive readiness (default: 30000; max: 300000)")),
+        /// Pane that issued the start, recorded as the agent's `spawned_by`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub caller_pane_id: Option<String> => Field::new(None::<String>),
+    }
+}
+
+cli_params! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+    pub struct AgentWaitManyParams => AgentWaitManyProjection {
+        pub targets: Vec<String> => Field::new(Vec::new()).input(bindings::wait_many_targets()),
+        /// Wait until every target settles or exits instead of the first one.
+        #[serde(default, skip_serializing_if = "super::is_false")]
+        pub all: bool => Field::new(false).input(bindings::wait_many_all()),
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub until: Vec<AgentStatus> => Field::new(Vec::new()).input(bindings::until()
+            .help("State to match; repeat for more than one state")),
+        /// `state_cursor` from `agent.list` or an earlier `agent.wait_many`. Only state changes after it settle a target.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub since: Option<String> => Field::new(None).input(bindings::since()),
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timeout_ms: Option<u64> => Field::new(None).input(bindings::timeout()
+            .help("Fail after this many milliseconds")),
     }
 }
 
@@ -231,6 +253,9 @@ pub struct AgentInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<AgentSessionInfo>,
+    /// Terminal that started this agent through `agent.start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_by: Option<AgentSpawnerInfo>,
     pub workspace_id: String,
     pub tab_id: String,
     pub pane_id: String,
@@ -249,6 +274,41 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
+}
+
+/// Opaque position in one server's agent state-change sequence.
+///
+/// Sequence numbers restart with each server process, so a cursor carries the
+/// epoch of the process that issued it and is ignored by any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentStateCursor {
+    pub epoch: u64,
+    pub seq: u64,
+}
+
+impl AgentStateCursor {
+    pub fn encode(self) -> String {
+        format!("{:x}.{}", self.epoch, self.seq)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        let (epoch, seq) = value.split_once('.')?;
+        Some(Self {
+            epoch: u64::from_str_radix(epoch, 16).ok()?,
+            seq: seq.parse().ok()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentSpawnerInfo {
+    pub terminal_id: String,
+    /// Current pane hosting the spawning terminal; omitted once that pane closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_id: Option<String>,
+    /// Current agent name in the spawning terminal, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
