@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ratatui::layout::Direction;
@@ -105,6 +105,12 @@ pub struct PaneSnapshot {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_agent_kind: Option<String>,
+    /// Saved only for panes that started a named agent, so restore can relink `agent_spawned_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Saved `terminal_id` of the pane that started this pane's named agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_spawned_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session: Option<PaneAgentSessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,11 +276,12 @@ pub fn capture(
     active: Option<usize>,
     selected: usize,
 ) -> SessionSnapshot {
+    let spawners = persisted_agent_spawners(terminals);
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
         workspaces: workspaces
             .iter()
-            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes))
+            .map(|workspace| capture_workspace(workspace, terminals, terminal_runtimes, &spawners))
             .collect(),
         active,
         selected,
@@ -291,11 +298,12 @@ fn capture_workspace(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    spawners: &HashSet<&crate::terminal::TerminalId>,
 ) -> WorkspaceSnapshot {
     let tabs: Vec<_> = ws
         .tabs
         .iter()
-        .map(|tab| capture_tab(tab, terminals, terminal_runtimes))
+        .map(|tab| capture_tab(tab, terminals, terminal_runtimes, spawners))
         .collect();
     let identity_cwd = tabs
         .first()
@@ -327,6 +335,7 @@ fn capture_tab(
         crate::terminal::TerminalState,
     >,
     terminal_runtimes: &TerminalRuntimeRegistry,
+    spawners: &HashSet<&crate::terminal::TerminalId>,
 ) -> TabSnapshot {
     let mut panes = HashMap::new();
     for id in tab.panes.keys() {
@@ -338,7 +347,7 @@ fn capture_tab(
             .or_else(|| terminal.map(|terminal| terminal.cwd.clone()))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| "/".into()));
         let label = terminal.and_then(|terminal| terminal.manual_label.clone());
-        let (agent_name, managed_agent_kind) = terminal
+        let (agent_name, managed_agent_kind, agent_spawned_by) = terminal
             .filter(|terminal| !terminal.managed_agent_launch_pending())
             .map(|terminal| {
                 (
@@ -346,9 +355,13 @@ fn capture_tab(
                     terminal
                         .managed_agent_kind()
                         .map(|agent| crate::detect::agent_label(agent).to_string()),
+                    terminal.agent_spawned_by().map(ToString::to_string),
                 )
             })
             .unwrap_or_default();
+        let saved_terminal_id = terminal_id
+            .filter(|terminal_id| spawners.contains(terminal_id))
+            .map(ToString::to_string);
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
             if let Some(authority) = terminal.hook_authority.as_ref() {
@@ -385,6 +398,8 @@ fn capture_tab(
                 label,
                 agent_name,
                 managed_agent_kind,
+                terminal_id: saved_terminal_id,
+                agent_spawned_by,
                 agent_session,
                 agent_resume,
                 launch_argv,
@@ -399,6 +414,17 @@ fn capture_tab(
         focused: Some(tab.layout.focused().raw()),
         root_pane: Some(tab.root_pane.raw()),
     }
+}
+
+/// Terminals whose saved ID a persisted `agent_spawned_by` refers to.
+fn persisted_agent_spawners(
+    terminals: &HashMap<crate::terminal::TerminalId, crate::terminal::TerminalState>,
+) -> HashSet<&crate::terminal::TerminalId> {
+    terminals
+        .values()
+        .filter(|terminal| !terminal.managed_agent_launch_pending())
+        .filter_map(crate::terminal::TerminalState::agent_spawned_by)
+        .collect()
 }
 
 pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
@@ -704,6 +730,8 @@ mod tests {
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
+                terminal_id: None,
+                agent_spawned_by: None,
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
@@ -716,6 +744,8 @@ mod tests {
                 label: Some("website".into()),
                 agent_name: None,
                 managed_agent_kind: None,
+                terminal_id: None,
+                agent_spawned_by: None,
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
@@ -1402,6 +1432,8 @@ mod tests {
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
+                terminal_id: None,
+                agent_spawned_by: None,
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,
@@ -1416,6 +1448,8 @@ mod tests {
                 label: None,
                 agent_name: None,
                 managed_agent_kind: None,
+                terminal_id: None,
+                agent_spawned_by: None,
                 agent_session: None,
                 agent_resume: None,
                 launch_argv: None,

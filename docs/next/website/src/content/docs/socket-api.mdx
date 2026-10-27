@@ -106,12 +106,16 @@ Raw socket method names use dot notation:
 | Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
-| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
+| Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.wait_many`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
 | Events | `events.subscribe`, `events.wait` |
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
 `agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
+
+`agent.wait_many` is server-owned and event-driven too. It takes `targets`, an optional `all` flag, `until`, `since`, and `timeout_ms`, and pins each target to its occupant when the wait starts. It returns `agent_wait_many` with `settled`, `pending`, and `exited` agent arrays, a `missing` array of targets that did not resolve to a live agent, and `state_cursor`. Without `all` it returns once any target settles, exits, or is missing; with `all` once every resolved target has settled or exited. `since` takes a `state_cursor` from `agent.list` or an earlier `agent.wait_many`; only states reached after it settle a target. Cursors are opaque and scoped to the server process that issued them, so a cursor from another process is ignored. An empty `targets` array fails with `invalid_agent_targets` and a malformed cursor with `invalid_agent_state_cursor`. Older servers reject the method as `invalid_request`.
+
+`agent.start` accepts an optional `caller_pane_id`, which the CLI fills from `HERDR_PANE_ID`. When it resolves to another pane, the started agent reports `spawned_by` with that terminal's `terminal_id`, its current `pane_id` while the pane is open, and the `name` of its current named agent. An unresolvable caller starts the agent without lineage. Older servers ignore the field.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 

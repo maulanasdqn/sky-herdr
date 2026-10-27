@@ -537,6 +537,7 @@ impl App {
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
             next_agent_state_change_seq: 0,
+            agent_state_epoch: agents::new_agent_state_epoch(),
             confirm_close: config.ui.confirm_close,
             pane_borders: config.ui.pane_borders,
             pane_outer_borders: config.ui.pane_outer_borders,
@@ -2981,6 +2982,7 @@ mod tests {
                 pane_id,
                 args: Vec::new(),
                 timeout_ms: Some(1_000),
+                caller_pane_id: None,
             }),
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
@@ -2988,6 +2990,79 @@ mod tests {
         assert_eq!(response["error"]["code"], "agent_pane_unavailable");
         assert_eq!(app.state.workspaces[0].tabs[0].layout.pane_count(), 1);
         assert_eq!(app.state.workspaces[0].focused_pane_id(), Some(root));
+    }
+
+    #[tokio::test]
+    async fn agent_start_records_the_calling_pane_as_spawner() {
+        let mut app = test_app();
+        let mut workspace = Workspace::test_new("agent-start-lineage");
+        let lead = workspace.tabs[0].root_pane;
+        let worker = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        let stray = workspace.test_split(ratatui::layout::Direction::Vertical);
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        let terminal_id = |app: &App, pane| {
+            app.state.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone()
+        };
+        let lead_terminal = terminal_id(&app, lead);
+        app.state
+            .terminals
+            .get_mut(&lead_terminal)
+            .unwrap()
+            .set_agent_name("lead".into());
+        let mut _inputs = Vec::new();
+        for pane in [worker, stray] {
+            let (runtime, input) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+            app.terminal_runtimes
+                .insert(terminal_id(&app, pane), runtime);
+            _inputs.push(input);
+        }
+        let lead_pane = app.pane_info(0, lead).unwrap().pane_id;
+        let start = |app: &mut App, name: &str, pane, caller: &str| {
+            let response = app.handle_api_request(crate::api::schema::Request {
+                id: format!("req_start_{name}"),
+                method: crate::api::schema::Method::AgentStart(
+                    crate::api::schema::AgentStartParams {
+                        name: name.into(),
+                        kind: "pi".into(),
+                        pane_id: app.pane_info(0, pane).unwrap().pane_id,
+                        args: Vec::new(),
+                        timeout_ms: Some(4_000),
+                        caller_pane_id: Some(caller.into()),
+                    },
+                ),
+            });
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()
+        };
+
+        let started = start(&mut app, "worker", worker, &lead_pane);
+        assert_eq!(started["result"]["type"], "agent_started", "{started}");
+        assert_eq!(
+            started["result"]["agent"]["spawned_by"],
+            serde_json::json!({
+                "terminal_id": lead_terminal.to_string(),
+                "pane_id": lead_pane,
+                "name": "lead",
+            })
+        );
+
+        let unattributed = start(&mut app, "stray", stray, "w9:p9");
+        assert_eq!(unattributed["result"]["type"], "agent_started");
+        assert!(unattributed["result"]["agent"].get("spawned_by").is_none());
+
+        let listed = app.handle_api_request(crate::api::schema::Request {
+            id: "req_list".into(),
+            method: crate::api::schema::Method::AgentList(Default::default()),
+        });
+        let listed: serde_json::Value = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            listed["result"]["state_cursor"],
+            app.agent_state_cursor().encode()
+        );
     }
 
     #[tokio::test]
@@ -3023,6 +3098,7 @@ mod tests {
                 pane_id: pane_id.clone(),
                 args: vec!["resume".into(), "codex-session".into()],
                 timeout_ms: Some(4_000),
+                caller_pane_id: None,
             }),
         };
         let response = app.handle_api_request(request());

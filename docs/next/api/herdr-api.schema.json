@@ -1346,6 +1346,13 @@
               },
               "type": "array"
             },
+            "caller_pane_id": {
+              "description": "Pane that issued the start, recorded as the agent's `spawned_by`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "kind": {
               "type": "string"
             },
@@ -1669,6 +1676,45 @@
               "type": "object"
             }
           ]
+        },
+        "AgentWaitManyParams": {
+          "properties": {
+            "all": {
+              "description": "Wait until every target settles or exits instead of the first one.",
+              "type": "boolean"
+            },
+            "since": {
+              "description": "`state_cursor` from `agent.list` or an earlier `agent.wait_many`. Only state changes after it settle a target.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "targets": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "timeout_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "until": {
+              "items": {
+                "$ref": "#/schemas/request/$defs/AgentStatus"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "targets"
+          ],
+          "type": "object"
         },
         "AgentWaitParams": {
           "properties": {
@@ -6312,6 +6358,22 @@
             "params"
           ],
           "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "agent.wait_many",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentWaitManyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
         }
       ],
       "properties": {
@@ -6614,6 +6676,17 @@
             "screen_detection_skipped": {
               "type": "boolean"
             },
+            "spawned_by": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AgentSpawnerInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Terminal that started this agent through `agent.start`."
+            },
             "state_change_seq": {
               "default": 0,
               "format": "uint64",
@@ -6765,6 +6838,31 @@
             "path"
           ],
           "type": "string"
+        },
+        "AgentSpawnerInfo": {
+          "properties": {
+            "name": {
+              "description": "Current agent name in the spawning terminal, if any.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "pane_id": {
+              "description": "Current pane hosting the spawning terminal; omitted once that pane closes.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id"
+          ],
+          "type": "object"
         },
         "AgentStatus": {
           "enum": [
@@ -9500,6 +9598,13 @@
                   },
                   "type": "array"
                 },
+                "state_cursor": {
+                  "description": "Current position in the agent state-change sequence, for `agent.wait_many` `since`.",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "type": {
                   "const": "agent_list",
                   "type": "string"
@@ -9508,6 +9613,55 @@
               "required": [
                 "type",
                 "agents"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "exited": {
+                  "description": "Targets that stopped hosting the waited agent, with their last observed state.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                  },
+                  "type": "array"
+                },
+                "missing": {
+                  "description": "Requested targets that did not resolve to a live agent.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "pending": {
+                  "description": "Targets that have not settled yet.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                  },
+                  "type": "array"
+                },
+                "settled": {
+                  "description": "Targets in a requested state after the cursor, as observed when they settled.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                  },
+                  "type": "array"
+                },
+                "state_cursor": {
+                  "description": "Pass back as `since` so already reported state changes do not settle again.",
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_wait_many",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "settled",
+                "pending",
+                "exited",
+                "missing",
+                "state_cursor"
               ],
               "type": "object"
             },

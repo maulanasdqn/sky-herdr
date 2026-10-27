@@ -50,13 +50,14 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         Err(ParseError::Io(error)) => return Err(error),
     };
     match operation {
-        Operation::List => agent_list(),
+        Operation::List(spawned_by) => agent_list(spawned_by),
         Operation::Get(params) => agent_get(params),
         Operation::Focus(params) => agent_focus(params),
         Operation::Read(params) => agent_read(params),
         Operation::SendKeys(params) => agent_send_keys(params),
         Operation::Rename(params) => agent_rename(params),
         Operation::Wait(params) => agent_wait(params),
+        Operation::WaitMany(params) => agent_wait_many(params),
         Operation::Prompt(params) => agent_prompt(params),
         Operation::Start(params) => agent_start(params),
         Operation::Attach(params) => agent_attach(params),
@@ -257,7 +258,9 @@ fn agent_start(params: AgentStartParams) -> std::io::Result<i32> {
         pane_id,
         args: agent_args,
         timeout_ms,
+        caller_pane_id: _,
     } = params;
+    let caller_pane_id = super::target::caller_pane_id();
     let Some(expected_kind) = crate::detect::parse_agent_label(&kind) else {
         eprintln!("unsupported interactive agent kind: {kind}");
         return Ok(2);
@@ -288,6 +291,7 @@ fn agent_start(params: AgentStartParams) -> std::io::Result<i32> {
                 pane_id: pane_id.clone(),
                 args: agent_args.clone(),
                 timeout_ms,
+                caller_pane_id: caller_pane_id.clone(),
             }),
         })?;
         if response.get("error").is_none() {
@@ -346,11 +350,66 @@ fn agent_start(params: AgentStartParams) -> std::io::Result<i32> {
     }
 }
 
-fn agent_list() -> std::io::Result<i32> {
-    super::print_response(&super::send_request(&Request {
-        id: "cli:agent:list".into(),
+fn agent_list(spawned_by: bindings::SpawnedBy) -> std::io::Result<i32> {
+    let spawner = if spawned_by.is_set() {
+        match spawner_terminal_id(&spawned_by, "cli:agent:list")? {
+            Ok(spawner) => Some(spawner),
+            Err(error) => return super::print_response(&error),
+        }
+    } else {
+        None
+    };
+    let mut response = list_agents("cli:agent:list")?;
+    if let (Some(spawner), Some(agents)) = (spawner, response["result"]["agents"].as_array_mut()) {
+        agents.retain(|agent| agent_spawned_by(agent, &spawner));
+    }
+    super::print_response(&response)
+}
+
+fn list_agents(request_id: &str) -> std::io::Result<serde_json::Value> {
+    super::send_request(&Request {
+        id: request_id.into(),
         method: Method::AgentList(EmptyParams::default()),
-    })?)
+    })
+}
+
+fn agent_spawned_by(agent: &serde_json::Value, spawner_terminal_id: &str) -> bool {
+    agent["spawned_by"]["terminal_id"].as_str() == Some(spawner_terminal_id)
+}
+
+/// Resolves `--children` or `--spawned-by` to the spawning terminal. Pane IDs
+/// win so a plain shell pane can be a spawner; agent names come next.
+fn spawner_terminal_id(
+    spawned_by: &bindings::SpawnedBy,
+    request_id: &str,
+) -> std::io::Result<Result<String, serde_json::Value>> {
+    let target = match &spawned_by.spawned_by {
+        Some(target) => target.clone(),
+        None => match super::target::caller_pane_id() {
+            Some(pane_id) => pane_id,
+            None => {
+                return Ok(Err(cli_agent_error(
+                    request_id,
+                    "caller_pane_unavailable",
+                    "--children requires HERDR_PANE_ID on this server; use --spawned-by <TARGET>",
+                )));
+            }
+        },
+    };
+    let pane = super::send_request(&Request {
+        id: request_id.into(),
+        method: Method::PaneGet(PaneTarget {
+            pane_id: super::normalize_pane_id(&target),
+        }),
+    })?;
+    if let Some(terminal_id) = pane["result"]["pane"]["terminal_id"].as_str() {
+        return Ok(Ok(terminal_id.to_owned()));
+    }
+    let agent = resolve_agent_target(&target, request_id)?;
+    match agent["result"]["agent"]["terminal_id"].as_str() {
+        Some(terminal_id) => Ok(Ok(terminal_id.to_owned())),
+        None => Ok(Err(agent)),
+    }
 }
 
 fn agent_get(params: AgentTarget) -> std::io::Result<i32> {
@@ -388,6 +447,59 @@ fn agent_wait(params: AgentWaitParams) -> std::io::Result<i32> {
         id: "cli:agent:wait".into(),
         method: Method::AgentWait(params),
     })?)
+}
+
+fn agent_wait_many(params: bindings::WaitMany) -> std::io::Result<i32> {
+    let bindings::WaitMany {
+        mut params,
+        spawned_by,
+    } = params;
+    if spawned_by.is_set() {
+        match spawned_agent_targets(&spawned_by)? {
+            Ok(targets) => params.targets = targets,
+            Err(error) => return super::print_response(&error),
+        }
+    }
+    super::print_response(&super::send_request(&Request {
+        id: "cli:agent:wait-many".into(),
+        method: Method::AgentWaitMany(params),
+    })?)
+}
+
+/// Lists live agents started from the selected spawner, addressed by name
+/// because `agent start` always names the agents it records.
+fn spawned_agent_targets(
+    spawned_by: &bindings::SpawnedBy,
+) -> std::io::Result<Result<Vec<String>, serde_json::Value>> {
+    const REQUEST_ID: &str = "cli:agent:wait-many";
+    let spawner = match spawner_terminal_id(spawned_by, REQUEST_ID)? {
+        Ok(spawner) => spawner,
+        Err(error) => return Ok(Err(error)),
+    };
+    let response = list_agents(REQUEST_ID)?;
+    if response.get("error").is_some() {
+        return Ok(Err(response));
+    }
+    let targets: Vec<String> = response["result"]["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|agent| agent_spawned_by(agent, &spawner))
+        .filter_map(|agent| {
+            agent["name"]
+                .as_str()
+                .or_else(|| agent["pane_id"].as_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(Err(cli_agent_error(
+            REQUEST_ID,
+            "no_spawned_agents",
+            "no live agents were started from the selected pane",
+        )));
+    }
+    Ok(Ok(targets))
 }
 
 fn wait_for_named_agent(

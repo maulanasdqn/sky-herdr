@@ -2,11 +2,12 @@ use clap::{ArgGroup, ArgMatches, Command};
 
 use crate::api::schema::agents::{
     AgentPromptProjection, AgentPromptWaitProjection, AgentReadProjection, AgentRenameProjection,
-    AgentSendKeysProjection, AgentStartProjection, AgentWaitProjection,
+    AgentSendKeysProjection, AgentStartProjection, AgentWaitManyProjection, AgentWaitProjection,
 };
 use crate::api::schema::{
     AgentPromptParams, AgentReadParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams,
-    AgentStatus, AgentTarget, AgentWaitParams, ReadFormat, ReadSource, READ_FORMATS, READ_SOURCES,
+    AgentStatus, AgentTarget, AgentWaitManyParams, AgentWaitParams, ReadFormat, ReadSource,
+    READ_FORMATS, READ_SOURCES,
 };
 pub(crate) use crate::cli::projection::optional_text;
 use crate::cli::projection::{
@@ -171,6 +172,28 @@ pub(crate) fn clear_name() -> Input<Option<String>> {
     })
 }
 
+pub(crate) fn wait_many_targets() -> Input<Vec<String>> {
+    Input::<Vec<String>>::positional("target", 0, |slot, value| {
+        slot.push(value.to_owned());
+        Ok(())
+    })
+    .value_name("TARGET")
+    .configure(|arg| arg.required(false).num_args(0..).allow_hyphen_values(false))
+}
+
+pub(crate) fn wait_many_all() -> Input<bool> {
+    Input::flag("all", |slot, _| {
+        *slot = true;
+        Ok(())
+    })
+    .help("Wait until every target settles or exits instead of the first")
+}
+
+pub(crate) fn since() -> Input<Option<String>> {
+    optional_text("since", "CURSOR")
+        .help("Only count state changes after this state_cursor from agent list or wait-many")
+}
+
 pub(crate) fn wait_presence() -> Input<Option<crate::api::schema::AgentPromptWaitOptions>> {
     Input::flag("wait", |slot, _| {
         *slot = Some(crate::api::schema::AgentPromptWaitOptions {
@@ -201,6 +224,34 @@ cli_projection! {
     }
 }
 
+/// Selects agents by the terminal that started them. CLI-only: the API exposes
+/// `spawned_by` on each agent and callers filter on it.
+pub(crate) struct SpawnedBy {
+    pub(crate) children: bool,
+    pub(crate) spawned_by: Option<String>,
+}
+
+impl SpawnedBy {
+    pub(crate) fn is_set(&self) -> bool {
+        self.children || self.spawned_by.is_some()
+    }
+}
+
+cli_projection! {
+    SpawnedByProjection for SpawnedBy {
+        children => Field::new(false).input(Input::flag("children", |slot, _| { *slot = true; Ok(()) })
+            .help("Only agents started from the calling pane")
+            .configure(|arg| arg.conflicts_with("spawned-by"))),
+        spawned_by => Field::new(None).input(optional_text("spawned-by", "TARGET")
+            .help("Only agents started from this pane or agent")),
+    }
+}
+
+pub(crate) struct WaitMany {
+    pub(crate) params: AgentWaitManyParams,
+    pub(crate) spawned_by: SpawnedBy,
+}
+
 pub(crate) struct Explain {
     pub(crate) target: Option<String>,
     pub(crate) file: Option<String>,
@@ -225,13 +276,14 @@ cli_projection! {
 }
 
 pub(crate) enum Operation {
-    List,
+    List(SpawnedBy),
     Get(AgentTarget),
     Focus(AgentTarget),
     Read(AgentReadParams),
     SendKeys(AgentSendKeysParams),
     Rename(AgentRenameParams),
     Wait(AgentWaitParams),
+    WaitMany(WaitMany),
     Prompt(AgentPromptParams),
     Start(AgentStartParams),
     Attach(Attach),
@@ -246,7 +298,7 @@ pub(crate) fn command() -> Command {
     Command::new("agent")
         .about("Control and inspect agent panes")
         .subcommand_required(true)
-        .subcommand(leaf("list", Vec::new(), "List agents"))
+        .subcommand(leaf("list", SpawnedByProjection::arguments(), "List agents"))
         .subcommand(leaf("get", TargetProjection::arguments(), "Show an agent"))
         .subcommand(leaf("focus", TargetProjection::arguments(), "Focus an agent"))
         .subcommand(leaf("read", AgentReadProjection::arguments(), "Read agent terminal output")
@@ -259,6 +311,11 @@ pub(crate) fn command() -> Command {
         .subcommand(leaf("wait", AgentWaitProjection::arguments(), "Wait until an agent reaches one of the requested states")
             .override_usage("herdr agent wait <TARGET> [OPTIONS]")
             .after_help("Without --until, matches idle, done, or blocked. Use --until unknown explicitly when needed. Without --timeout, waits indefinitely."))
+        .subcommand(leaf("wait-many", AgentWaitManyProjection::arguments(), "Wait until one or all of several agents reach a requested state")
+            .args(SpawnedByProjection::arguments().into_iter().map(|arg| arg.conflicts_with("target")))
+            .group(ArgGroup::new("wait_many_targets").args(["target", "children", "spawned-by"]).required(true))
+            .override_usage("herdr agent wait-many <TARGET>... | --children | --spawned-by <TARGET> [OPTIONS]")
+            .after_help("Returns as soon as any target settles, or with --all once every target has settled or exited. The result lists settled, pending, and exited agents plus targets that were missing, and a state_cursor. Pass a state_cursor from agent list (taken before prompting) or from the previous wait-many as --since so states reached earlier do not count again. Without --until, matches idle, done, or blocked. Without --timeout, waits indefinitely."))
         .subcommand(leaf("prompt", AgentPromptProjection::arguments(), "Submit a prompt to an agent")
             .args(AgentPromptWaitProjection::arguments().into_iter().map(|arg| arg.requires("wait")))
             .override_usage("herdr agent prompt <TARGET> <TEXT> [OPTIONS]")
@@ -277,7 +334,7 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Operation, ParseError
         return Err(ParseError::Usage("missing agent command".into()));
     };
     Ok(match name {
-        "list" => Operation::List,
+        "list" => Operation::List(SpawnedByProjection::from_matches(matches)?),
         "get" => Operation::Get(TargetProjection::from_matches(matches)?),
         "focus" => Operation::Focus(TargetProjection::from_matches(matches)?),
         "read" => {
@@ -288,6 +345,10 @@ pub(crate) fn from_matches(matches: &ArgMatches) -> Result<Operation, ParseError
         "send-keys" => Operation::SendKeys(AgentSendKeysProjection::from_matches(matches)?),
         "rename" => Operation::Rename(AgentRenameProjection::from_matches(matches)?),
         "wait" => Operation::Wait(AgentWaitProjection::from_matches(matches)?),
+        "wait-many" => Operation::WaitMany(WaitMany {
+            params: AgentWaitManyProjection::from_matches(matches)?,
+            spawned_by: SpawnedByProjection::from_matches(matches)?,
+        }),
         "prompt" => {
             let mut params = AgentPromptProjection::from_matches(matches)?;
             if params.wait.is_some() {

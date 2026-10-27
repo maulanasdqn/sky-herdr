@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
@@ -12,6 +13,16 @@ const INVALID_AGENT_TIMEOUT_MESSAGE: &str =
     "agent start timeout must be greater than 3000ms and at most 300000ms";
 const INVALID_AGENT_NAME_MESSAGE: &str = "agent name must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_' (1-32 characters)";
 
+/// State-change sequence numbers restart with every server process, including
+/// live handoff, so each process stamps its cursors with a fresh epoch.
+pub(super) fn new_agent_state_epoch() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ u64::from(std::process::id()).rotate_left(32)
+}
+
 fn valid_agent_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some('a'..='z'))
@@ -21,6 +32,9 @@ fn valid_agent_name(name: &str) -> bool {
 
 impl App {
     pub(super) fn collect_agent_infos(&self) -> Vec<crate::api::schema::AgentInfo> {
+        // Client-shell snapshots collect agents on every render, so locate spawners once.
+        let spawner_panes = self.agent_spawner_panes();
+        let spawner_panes = spawner_panes.as_ref();
         self.state
             .workspaces
             .iter()
@@ -30,10 +44,36 @@ impl App {
                     tab.layout
                         .pane_ids()
                         .into_iter()
-                        .filter_map(move |pane_id| self.agent_info(ws_idx, pane_id))
+                        .filter_map(move |pane_id| {
+                            self.agent_info_with_spawners(ws_idx, pane_id, spawner_panes)
+                        })
                 })
             })
             .collect()
+    }
+
+    /// Pane hosting each terminal, built only when some agent records a spawner.
+    fn agent_spawner_panes(
+        &self,
+    ) -> Option<HashMap<&crate::terminal::TerminalId, (usize, crate::layout::PaneId)>> {
+        self.state
+            .terminals
+            .values()
+            .any(|terminal| terminal.agent_spawned_by().is_some())
+            .then(|| {
+                self.state
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(ws_idx, ws)| {
+                        ws.tabs.iter().flat_map(move |tab| {
+                            tab.panes.iter().map(move |(pane_id, pane)| {
+                                (&pane.attached_terminal_id, (ws_idx, *pane_id))
+                            })
+                        })
+                    })
+                    .collect()
+            })
     }
 
     pub(super) fn reconcile_managed_agent_target(&mut self, target: &str) {
@@ -58,6 +98,13 @@ impl App {
             self.state.mark_session_dirty();
             self.schedule_session_save();
             self.emit_pane_updated(resolved.ws_idx, resolved.pane_id);
+        }
+    }
+
+    pub(super) fn agent_state_cursor(&self) -> crate::api::schema::AgentStateCursor {
+        crate::api::schema::AgentStateCursor {
+            epoch: self.state.agent_state_epoch,
+            seq: self.state.next_agent_state_change_seq,
         }
     }
 
@@ -187,6 +234,18 @@ impl App {
         if terminal.is_agent_terminal() || terminal.managed_agent_kind().is_some() {
             return Err(AgentStartError::TargetBusy(params.pane_id));
         }
+        // Lineage is metadata: an unresolvable caller starts the agent without it.
+        let spawned_by = params
+            .caller_pane_id
+            .as_deref()
+            .and_then(|caller| self.parse_pane_id(caller))
+            .and_then(|(caller_ws_idx, caller_pane_id)| {
+                self.state
+                    .workspaces
+                    .get(caller_ws_idx)?
+                    .terminal_id(caller_pane_id)
+                    .cloned()
+            });
         let runtime = self
             .terminal_runtimes
             .get(&terminal_id)
@@ -219,6 +278,9 @@ impl App {
             .get_mut(&terminal_id)
             .ok_or_else(|| AgentStartError::TargetUnavailable(params.pane_id.clone()))?;
         terminal.begin_managed_agent(name.clone(), kind, now, AGENT_START_SETTLE_DELAY, timeout);
+        if let Some(spawner) = spawned_by {
+            terminal.set_agent_spawned_by(spawner);
+        }
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
@@ -372,6 +434,17 @@ impl App {
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
     ) -> Option<crate::api::schema::AgentInfo> {
+        self.agent_info_with_spawners(ws_idx, pane_id, None)
+    }
+
+    fn agent_info_with_spawners(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+        spawner_panes: Option<
+            &HashMap<&crate::terminal::TerminalId, (usize, crate::layout::PaneId)>,
+        >,
+    ) -> Option<crate::api::schema::AgentInfo> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
@@ -392,6 +465,9 @@ impl App {
             state_labels: pane.state_labels,
             tokens: pane.tokens,
             agent_session: pane.agent_session,
+            spawned_by: terminal
+                .agent_spawned_by()
+                .map(|spawner| self.agent_spawner_info(spawner, spawner_panes)),
             workspace_id: pane.workspace_id,
             tab_id: pane.tab_id,
             pane_id: pane.pane_id,
@@ -404,6 +480,41 @@ impl App {
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
         })
+    }
+
+    fn agent_spawner_info(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        spawner_panes: Option<
+            &HashMap<&crate::terminal::TerminalId, (usize, crate::layout::PaneId)>,
+        >,
+    ) -> crate::api::schema::AgentSpawnerInfo {
+        let pane = match spawner_panes {
+            Some(spawner_panes) => spawner_panes.get(terminal_id).copied(),
+            None => self
+                .state
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(ws_idx, ws)| {
+                    ws.tabs.iter().find_map(|tab| {
+                        tab.panes
+                            .iter()
+                            .find(|(_, pane)| pane.attached_terminal_id == *terminal_id)
+                            .map(|(pane_id, _)| (ws_idx, *pane_id))
+                    })
+                }),
+        };
+        let pane_id = pane.and_then(|(ws_idx, pane_id)| self.public_pane_id(ws_idx, pane_id));
+        crate::api::schema::AgentSpawnerInfo {
+            terminal_id: terminal_id.to_string(),
+            pane_id,
+            name: self
+                .state
+                .terminals
+                .get(terminal_id)
+                .and_then(|terminal| terminal.agent_name.clone()),
+        }
     }
 
     fn agent_name_conflicts(

@@ -38,6 +38,7 @@ impl App {
             id,
             ResponseResult::AgentList {
                 agents: self.collect_agent_infos(),
+                state_cursor: Some(self.agent_state_cursor().encode()),
             },
         )
     }

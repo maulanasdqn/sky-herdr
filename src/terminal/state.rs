@@ -143,6 +143,8 @@ pub struct TerminalState {
     pub manual_label: Option<String>,
     pub agent_name: Option<String>,
     agent_name_owner: Option<AgentNameOwner>,
+    /// Terminal that started this named agent. Cleared together with the name.
+    agent_spawned_by: Option<TerminalId>,
     managed_agent: Option<ManagedAgent>,
     codex_prompt_ready: bool,
     managed_agent_launch_session: Option<crate::agent_resume::PersistedAgentSession>,
@@ -183,6 +185,7 @@ impl TerminalState {
             manual_label: None,
             agent_name: None,
             agent_name_owner: None,
+            agent_spawned_by: None,
             managed_agent: None,
             codex_prompt_ready: false,
             managed_agent_launch_session: None,
@@ -2109,6 +2112,9 @@ impl TerminalState {
 
     pub fn set_agent_name(&mut self, name: String) {
         self.agent_name = (!name.is_empty()).then_some(name);
+        if self.agent_name.is_none() {
+            self.agent_spawned_by = None;
+        }
         self.agent_name_owner = self.agent_name.as_ref().and_then(|_| {
             self.hook_authority
                 .as_ref()
@@ -2144,6 +2150,7 @@ impl TerminalState {
     ) {
         self.codex_prompt_ready = false;
         self.set_agent_name(name);
+        self.agent_spawned_by = None;
         self.agent_process_acquisition_pending = true;
         self.agent_name_owner = Some(AgentNameOwner {
             agent_label: crate::detect::agent_label(kind).to_string(),
@@ -2321,7 +2328,20 @@ impl TerminalState {
         }
         self.agent_name = None;
         self.agent_name_owner = None;
+        self.agent_spawned_by = None;
         self.managed_agent = None;
+    }
+
+    pub fn agent_spawned_by(&self) -> Option<&TerminalId> {
+        self.agent_spawned_by.as_ref()
+    }
+
+    /// Records the terminal that started this named agent. Lineage belongs to the
+    /// agent name, so an unnamed agent or a self-reference records nothing.
+    pub fn set_agent_spawned_by(&mut self, spawner: TerminalId) {
+        if self.agent_name.is_some() && spawner != self.id {
+            self.agent_spawned_by = Some(spawner);
+        }
     }
 
     pub fn clear_agent_runtime_identity_after_respawn(&mut self) {
@@ -2374,6 +2394,7 @@ impl TerminalState {
             {
                 self.agent_name = None;
                 self.agent_name_owner = None;
+                self.agent_spawned_by = None;
             }
             Some(owner) if owner.session_ref.is_none() && session_ref.is_some() => {
                 owner.session_ref = session_ref.cloned();
@@ -2479,6 +2500,59 @@ mod tests {
             agent: agent_label.into(),
             session_ref,
         });
+    }
+
+    #[test]
+    fn agent_lineage_follows_the_agent_name() {
+        let spawner = TerminalId::alloc();
+        let mut terminal = test_terminal();
+        terminal.set_agent_spawned_by(spawner.clone());
+        assert_eq!(
+            terminal.agent_spawned_by(),
+            None,
+            "unnamed agents have no lineage"
+        );
+
+        let now = Instant::now();
+        terminal.begin_managed_agent(
+            "worker".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        terminal.set_agent_spawned_by(terminal.id.clone());
+        assert_eq!(
+            terminal.agent_spawned_by(),
+            None,
+            "a terminal cannot spawn itself"
+        );
+
+        terminal.set_agent_spawned_by(spawner.clone());
+        terminal.set_agent_name("renamed".into());
+        assert_eq!(terminal.agent_spawned_by(), Some(&spawner));
+
+        terminal.begin_managed_agent(
+            "next".into(),
+            Agent::Pi,
+            now,
+            Duration::ZERO,
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            terminal.agent_spawned_by(),
+            None,
+            "a new launch starts fresh"
+        );
+
+        terminal.set_agent_spawned_by(spawner.clone());
+        terminal.set_agent_name(String::new());
+        assert_eq!(terminal.agent_spawned_by(), None);
+
+        terminal.set_agent_name("worker".into());
+        terminal.set_agent_spawned_by(spawner);
+        terminal.clear_agent_name();
+        assert_eq!(terminal.agent_spawned_by(), None);
     }
 
     #[test]
