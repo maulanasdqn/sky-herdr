@@ -223,6 +223,7 @@ mod tests {
             state_labels: Vec::new(),
             tokens: Vec::new(),
             focused: true,
+            spawned_by: None,
         }
     }
 

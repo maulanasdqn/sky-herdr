@@ -1083,6 +1083,18 @@ pub struct ClientShellAgent {
     pub state_labels: Vec<(String, String)>,
     pub tokens: Vec<(String, String)>,
     pub focused: bool,
+    /// Terminal that started this agent through `agent start`. Older endpoints omit it.
+    #[serde(default)]
+    pub spawned_by: Option<ClientShellAgentSpawner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellAgentSpawner {
+    pub terminal_id: String,
+    /// Current pane hosting the spawning terminal, while that pane is open.
+    pub pane_id: Option<String>,
+    /// Current agent name in the spawning terminal, if any.
+    pub name: Option<String>,
 }
 
 /// Origin-relative geometry for one pane in a rendered pane surface.

@@ -321,7 +321,17 @@ pub(super) fn render_shell(
             &mut hits,
         );
     }
+    if layout.agent_teams.width > 0 {
+        super::agent_teams::render_agent_teams(
+            buffer,
+            layout.agent_teams,
+            snapshot,
+            config,
+            &mut hits,
+        );
+    }
     if !config.mouse_capture {
+        hits.agent_teams_close = Rect::default();
         hits.sidebar_divider = Rect::default();
         hits.sidebar_section_divider = Rect::default();
         hits.workspace_scrollbar = Rect::default();

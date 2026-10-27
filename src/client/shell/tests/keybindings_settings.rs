@@ -199,6 +199,8 @@ fn manual_client_chrome_preferences_round_trip_per_endpoint() {
     state.sidebar_section_split_manual = true;
     state.sidebar_collapsed = true;
     state.sidebar_collapsed_manual = true;
+    state.agent_teams_hidden = true;
+    state.agent_teams_hidden_manual = true;
     state.collapsed_groups.insert("repo-two".into());
     state.collapsed_groups.insert("repo-one".into());
     let profile =
@@ -223,6 +225,8 @@ fn manual_client_chrome_preferences_round_trip_per_endpoint() {
     assert!(reloaded.sidebar_section_split_manual);
     assert!(reloaded.sidebar_collapsed);
     assert!(reloaded.sidebar_collapsed_manual);
+    assert!(reloaded.agent_teams_hidden);
+    assert!(reloaded.agent_teams_hidden_manual);
     assert_eq!(
         reloaded.collapsed_groups,
         HashSet::from(["repo-one".to_string(), "repo-two".to_string()])

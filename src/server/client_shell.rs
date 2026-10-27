@@ -173,6 +173,13 @@ pub(super) fn snapshot_with_completions(
                 state_labels,
                 tokens,
                 focused,
+                spawned_by: agent
+                    .spawned_by
+                    .map(|spawner| protocol::ClientShellAgentSpawner {
+                        terminal_id: spawner.terminal_id,
+                        pane_id: spawner.pane_id,
+                        name: spawner.name,
+                    }),
             }
         })
         .collect();
@@ -715,6 +722,50 @@ mod tests {
             .terminal_runtimes
             .values()
             .all(|runtime| runtime.test_scroll_metrics_reads() == 1));
+    }
+
+    #[test]
+    fn snapshot_projects_agent_spawners_for_the_teams_panel() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = crate::app::App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let mut workspace = crate::workspace::Workspace::test_new("lead");
+        let lead = workspace.tabs[0].root_pane;
+        let worker = workspace.test_split(ratatui::layout::Direction::Horizontal);
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let terminal_id = |pane| {
+            app.state.workspaces[0].tabs[0].panes[&pane]
+                .attached_terminal_id
+                .clone()
+        };
+        let (lead_terminal, worker_terminal) = (terminal_id(lead), terminal_id(worker));
+        let terminal = app.state.terminals.get_mut(&worker_terminal).unwrap();
+        terminal.set_detected_state(
+            Some(crate::detect::Agent::Pi),
+            crate::detect::AgentState::Working,
+        );
+        terminal.set_agent_name("worker".into());
+        terminal.set_agent_spawned_by(lead_terminal.clone());
+
+        let shell = snapshot(&app, "boot", 1, None, None);
+        let [agent] = &shell.agents[..] else {
+            panic!("only the worker is an agent: {:?}", shell.agents);
+        };
+        assert_eq!(
+            agent.spawned_by,
+            Some(protocol::ClientShellAgentSpawner {
+                terminal_id: lead_terminal.to_string(),
+                pane_id: app.public_pane_id(0, lead),
+                name: None,
+            })
+        );
     }
 
     #[test]

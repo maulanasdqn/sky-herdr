@@ -1940,6 +1940,10 @@ impl ClientShellState {
                 self.workspace_press = None;
                 self.tab_press = None;
                 self.chrome_drag = None;
+                if super::contains(self.hits.agent_teams_close, point) {
+                    self.toggle_agent_teams(outcome);
+                    return;
+                }
                 // The toggle is painted over the agent scrollbar's last cell.
                 if super::contains(self.hits.sidebar_toggle, point) {
                     self.sidebar_collapsed = !self.sidebar_collapsed;

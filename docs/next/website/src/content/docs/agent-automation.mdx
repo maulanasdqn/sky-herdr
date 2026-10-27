@@ -49,7 +49,7 @@ Successful `agent start` returns only after Herdr detects the expected agent in 
 herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 ```
 
-`agent start` records the calling pane as the agent's spawner. `agent start`, `agent get`, and `agent list` then report `spawned_by` with the spawning terminal's `terminal_id`, its current `pane_id` while that pane is open, and the `name` of the agent it currently hosts, if any. Lineage belongs to the agent name: renames, pane moves, server restarts, and live handoff keep it whenever they keep the name, and clearing or losing the name clears it. List the agents you started with `herdr agent list --children`, or another pane's with `--spawned-by <pane-or-agent>`. `--children` needs the calling pane, so with `--machine` use `--spawned-by` and a remote pane ID or agent name.
+`agent start` records the calling pane as the agent's spawner. `agent start`, `agent get`, and `agent list` then report `spawned_by` with the spawning terminal's `terminal_id`, its current `pane_id` while that pane is open, and the `name` of the agent it currently hosts, if any. Lineage belongs to the agent name: renames, pane moves, server restarts, and live handoff keep it whenever they keep the name, and clearing or losing the name clears it. List the agents you started with `herdr agent list --children`, or another pane's with `--spawned-by <pane-or-agent>`. `--children` needs the calling pane, so with `--machine` use `--spawned-by` and a remote pane ID or agent name. In the TUI, the agent teams panel on the right shows the same grouping live.
 
 Agents launched manually are detected automatically and can be addressed by pane ID. Give one a name when a stable human-readable target is useful:
 

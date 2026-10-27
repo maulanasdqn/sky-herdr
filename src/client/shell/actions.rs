@@ -1,6 +1,25 @@
 use super::*;
 
 impl ClientShellState {
+    pub(super) fn toggle_agent_teams(&mut self, outcome: &mut ClientShellInput) {
+        let pane_surface = |state: &Self| {
+            state
+                .last_composed_size
+                .map(|(cols, rows)| state.layout(cols, rows).pane_surface)
+        };
+        let previous_surface = pane_surface(self);
+        self.agent_teams_hidden = !self.agent_teams_hidden;
+        self.agent_teams_hidden_manual = true;
+        // Only a panel that is actually laid out changes pane geometry; otherwise
+        // keep the current surface.
+        if pane_surface(self) != previous_surface {
+            self.invalidate_pane_surface();
+            outcome.resize = true;
+        }
+        outcome.repaint = true;
+        self.persist_chrome_preferences(outcome);
+    }
+
     pub(super) fn record_binding(
         &mut self,
         binding: crate::input::KeybindMatch,
@@ -9,6 +28,9 @@ impl ClientShellState {
         match binding {
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::Detach) => {
                 outcome.detach = true;
+            }
+            crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleAgentTeams) => {
+                self.toggle_agent_teams(outcome);
             }
             crate::input::KeybindMatch::Action(crate::input::KeybindAction::ToggleSidebar) => {
                 self.sidebar_collapsed = !self.sidebar_collapsed;

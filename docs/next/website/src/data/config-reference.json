@@ -842,6 +842,12 @@
           "description": "Toggle sidebar collapse."
         },
         {
+          "key": "keys.toggle_agent_teams",
+          "type": "keybinding",
+          "default": "\"prefix+shift+b\"",
+          "description": "Show or hide the agent teams panel."
+        },
+        {
           "key": "keys.indexed.tabs",
           "type": "string",
           "default": "unset",

@@ -59,6 +59,9 @@ impl ClientShellState {
             agent_panel_sort: self
                 .agent_panel_sort_manual
                 .then_some(self.config.agent_panel_sort),
+            agent_teams_hidden: self
+                .agent_teams_hidden_manual
+                .then_some(self.agent_teams_hidden),
             collapsed_groups,
             remote_collapsed_groups,
         };
@@ -389,6 +392,7 @@ impl ClientShellConfig {
         sidebar_collapsed: bool,
         tab_count: usize,
         sidebar_width: u16,
+        agent_teams_width: u16,
     ) -> ClientShellLayout {
         if cols <= self.mobile_width_threshold {
             let header_height = rows.min(2);
@@ -397,6 +401,7 @@ impl ClientShellConfig {
                 tab_bar: Rect::default(),
                 mobile_header: Rect::new(0, 0, cols, header_height),
                 pane_surface: Rect::new(0, header_height, cols, rows.saturating_sub(header_height)),
+                agent_teams: Rect::default(),
             };
         }
 
@@ -414,7 +419,20 @@ impl ClientShellConfig {
             sidebar_width.clamp(min, max)
         }
         .min(cols.saturating_sub(1));
-        let main = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
+        let available = cols.saturating_sub(sidebar_width);
+        let agent_teams_width = if available
+            >= agent_teams_width.saturating_add(super::agent_teams::AGENT_TEAMS_MIN_MAIN_WIDTH)
+        {
+            agent_teams_width
+        } else {
+            0
+        };
+        let main = Rect::new(
+            sidebar_width,
+            0,
+            available.saturating_sub(agent_teams_width),
+            rows,
+        );
         let show_tab_bar = rows > 1 && !(self.hide_tab_bar_when_single_tab && tab_count == 1);
         let tab_height = u16::from(show_tab_bar);
         let (tab_bar, pane_surface) = match self.tab_bar_position {
@@ -443,6 +461,7 @@ impl ClientShellConfig {
             tab_bar,
             mobile_header: Rect::default(),
             pane_surface,
+            agent_teams: Rect::new(main.right(), 0, agent_teams_width, rows),
         }
     }
 
@@ -460,7 +479,7 @@ impl ClientShellConfig {
             .unwrap_or(self.sidebar_width)
             .clamp(min_width, max_width);
         let surface = self
-            .layout(cols, rows, sidebar_collapsed, 0, sidebar_width)
+            .layout(cols, rows, sidebar_collapsed, 0, sidebar_width, 0)
             .pane_surface;
         ClientSurfaceSize {
             cols: surface.width.max(1),

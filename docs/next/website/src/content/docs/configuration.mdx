@@ -311,6 +311,8 @@ The active palette is applied in this order: built-in theme, `[theme.custom]`, t
 
 The sidebar is the main Herdr dashboard. Search `ui.` in the [Config reference](/docs/config-reference/) for sizing, collapsed mode, Agent panel ordering, mouse behavior, pane borders, and other presentation settings.
 
+While any agent was started with `herdr agent start` from another pane, an agent teams panel appears on the right edge. It lists each spawning pane with the agents it started indented beneath it, their live status, and `closed pane` for spawners that are gone; click a row to focus that pane. Press `prefix+shift+b` (`keys.toggle_agent_teams`) or click its `×` to hide or show it. The choice is remembered per server, like the collapsed sidebar. The panel needs at least 40 columns left for panes and stays hidden on narrower terminals and in the mobile layout.
+
 `ui.pane_borders` accepts `"auto"` (the default, borders only for split panes), `"always"` (also frame a single pane), or `"off"`. A single-pane frame requires `ui.pane_outer_borders = true`, because all its edges are outer edges. Existing boolean values remain valid: `true` means `"auto"` and `false` means `"off"`.
 
 Set `tab_bar_position = "bottom"` under `[ui]` to place the desktop tab row below the terminal panes. Prefix, Navigate, Copy, and Resize mode bars temporarily replace the bottom tab row while active. The default is `"top"`.
