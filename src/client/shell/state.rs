@@ -59,6 +59,7 @@ pub(super) struct ClientShellLayout {
     pub tab_bar: Rect,
     pub mobile_header: Rect,
     pub pane_surface: Rect,
+    pub agent_teams: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +104,7 @@ pub(super) struct ShellHitMap {
     pub(super) sidebar_divider: Rect,
     pub(super) sidebar_section_divider: Rect,
     pub(super) sidebar_toggle: Rect,
+    pub(super) agent_teams_close: Rect,
     pub(super) new_workspace: Rect,
     pub(super) new_tab: Rect,
     pub(super) tab_scroll_left: Rect,
@@ -876,6 +878,8 @@ pub(crate) struct ClientShellState {
     pub(super) sidebar_section_split: f32,
     pub(super) sidebar_section_split_manual: bool,
     pub(super) agent_panel_sort_manual: bool,
+    pub(super) agent_teams_hidden: bool,
+    pub(super) agent_teams_hidden_manual: bool,
     pub(super) last_sidebar_divider_click: Option<std::time::Instant>,
     pub(super) chrome_drag: Option<ClientChromeDrag>,
     pub(super) workspace_press: Option<ClientWorkspacePress>,
@@ -1050,6 +1054,8 @@ impl ClientShellState {
             sidebar_section_split,
             sidebar_section_split_manual: preferences.sidebar_section_split.is_some(),
             agent_panel_sort_manual: preferences.agent_panel_sort.is_some(),
+            agent_teams_hidden: preferences.agent_teams_hidden.unwrap_or(false),
+            agent_teams_hidden_manual: preferences.agent_teams_hidden.is_some(),
             last_sidebar_divider_click: None,
             chrome_drag: None,
             workspace_press: None,
@@ -1225,7 +1231,22 @@ impl ClientShellState {
             self.sidebar_collapsed,
             self.focused_tab_count(),
             self.sidebar_width,
+            self.agent_teams_width(),
         )
+    }
+
+    /// The agent teams panel appears only while some agent records a spawner.
+    pub(super) fn agent_teams_width(&self) -> u16 {
+        let visible = !self.agent_teams_hidden
+            && self
+                .snapshot
+                .as_deref()
+                .is_some_and(super::agent_teams::has_agent_teams);
+        if visible {
+            super::agent_teams::AGENT_TEAMS_WIDTH
+        } else {
+            0
+        }
     }
 
     pub(crate) fn surface_size(&self, cols: u16, rows: u16) -> ClientSurfaceSize {

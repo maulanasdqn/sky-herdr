@@ -292,6 +292,7 @@ mod tests {
             snapshot.workspaces[0].agent_status,
             crate::api::schema::AgentStatus::Unknown
         );
+        assert_eq!(snapshot.agents[0].spawned_by, None);
     }
 
     #[test]

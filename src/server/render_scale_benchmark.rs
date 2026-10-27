@@ -233,16 +233,23 @@ fn profile_snapshot_encoding(
     count: usize,
     client_count: usize,
     hidden_output: bool,
+    lineage: bool,
 ) -> (StageStats, StageStats) {
     let mut pipeline = RenderPipeline::new(build(count));
     pipeline.app.state.ensure_test_terminals();
-    for terminal in pipeline.app.state.terminals.values_mut() {
+    let spawner = pipeline.app.state.terminals.keys().next().cloned();
+    for (index, terminal) in pipeline.app.state.terminals.values_mut().enumerate() {
         terminal.set_detected_state(
             Some(crate::detect::Agent::Pi),
             crate::detect::AgentState::Idle,
         );
         terminal.last_agent_state_change_seq = Some(1);
         terminal.last_agent_completion_seq = Some(1);
+        // Worst case for the agent teams projection: every agent records a spawner.
+        if let Some(spawner) = spawner.clone().filter(|_| lineage) {
+            terminal.set_agent_name(format!("agent-{index}"));
+            terminal.set_agent_spawned_by(spawner);
+        }
     }
     let run = || {
         if hidden_output {
@@ -300,17 +307,19 @@ fn profile_snapshot_encoding(
 
 fn print_snapshot_encoding_profiles(label: &str, build: fn(usize) -> Vec<Workspace>) {
     println!("{label} populated agent snapshots + completions + JSON framing");
-    println!("       panes  clients  hidden_output  construction_us  median_us  p95_us  max_us");
+    println!(
+        "       panes  clients  hidden_output  lineage  construction_us  median_us  p95_us  max_us"
+    );
     for count in [1, 15, 118] {
         for client_count in [1, 2] {
-            for hidden_output in [false, true] {
+            for (hidden_output, lineage) in [(false, false), (true, false), (false, true)] {
                 if hidden_output && label != "background workspaces" {
                     continue;
                 }
                 let (construction, stats) =
-                    profile_snapshot_encoding(build, count, client_count, hidden_output);
+                    profile_snapshot_encoding(build, count, client_count, hidden_output, lineage);
                 println!(
-                    "  {count:>10}  {client_count:>7}  {hidden_output:>13}  {:>15}  {:>9}  {:>6}  {:>6}",
+                    "  {count:>10}  {client_count:>7}  {hidden_output:>13}  {lineage:>7}  {:>15}  {:>9}  {:>6}  {:>6}",
                     construction.median_us, stats.median_us, stats.p95_us, stats.max_us
                 );
             }
